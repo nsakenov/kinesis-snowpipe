@@ -1,0 +1,401 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Game pipeline with lambda and kinesis
+
+Parameters:
+  KinesisShards:
+    Type: Number
+    Description: Shards count for Kinesis Streams
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+  FirehoseInterval:
+    Type: Number
+    Description: Firehose buffering data before delivering S3
+    Default: 60
+    MinValue: 60
+    MaxValue: 900
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt 'PipelineRole.Arn'
+  BucketName:
+    Value: !Ref S3BucketRawData
+  ApiGatewayInvokeUrl:
+      Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/put-record"
+  
+Resources:
+### API ###
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: prod
+      Description: Live Stage
+      AutoDeploy: true
+
+  Integration:
+      Type: AWS::ApiGatewayV2::Integration
+      Properties:
+        ApiId: !Ref HttpApi
+        Description: Lambda proxy integration
+        IntegrationType: AWS_PROXY
+        IntegrationMethod: POST
+        PayloadFormatVersion: "2.0"
+        IntegrationUri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HttpApiLambda.Arn}/invocations'
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /put-record"
+      AuthorizationType: NONE
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref Integration
+
+### LAMBDA ###
+  HttpApiLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handle_event
+      Runtime: "python3.8"
+      Timeout: 100
+      MemorySize: 160
+      Environment:
+        Variables:
+          KINESIS_STREAM_NAME: !GetAtt Kinesis.Arn
+      Role: !GetAtt 'PipelineRole.Arn'
+      InlineCode: |
+        import json
+        import os
+        import uuid
+        import time
+        import boto3
+
+        def extract_body_dict_with_metadata(event: dict) -> dict:
+            if 'requestContext' not in event:
+                return None
+            if 'body' not in event:
+                return None
+            payload = json.loads(event.get('body'))
+            payload['server_received_time'] = int(time.time())
+            return payload
+
+        def create_response(status: int, msg: str):
+            return {
+                "isBase64Encoded": False,
+                "statusCode": status,
+                "body": f'{{"message": "{msg}"}}',
+                "headers": {
+                    "Content-Type": "application/json"
+                }
+            }
+
+        def send_body_to_kinesis(kinesis_stream_name, body_dict):
+            kinesis = boto3.client('kinesis')
+            encoded_data = (json.dumps(body_dict) + '\n').encode('utf-8')
+            kinesis.put_record(StreamName=kinesis_stream_name, Data=encoded_data, PartitionKey=str(uuid.uuid4()))
+
+        def handle_event(event, context):
+            kinesis_stream_name = os.getenv('KINESIS_STREAM_NAME').split('/')[1]
+            body_dict = extract_body_dict_with_metadata(event)
+            if not body_dict:
+                return create_response(400, 'Invalid request')
+            try:
+                send_body_to_kinesis(kinesis_stream_name, body_dict)
+                print('sent to kinesis')
+            except Exception as e:
+                return create_response(500, "Couldn't process the request.")
+            return create_response(200, 'OK')
+        
+  HttpApiLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HttpApiLambda
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+
+  ValidateEventsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ValidateEventsLambda
+      Principal: firehose.amazonaws.com
+
+  ValidateEventsLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: "python3.8"
+      Timeout: 100
+      MemorySize: 160
+      Environment:
+        Variables:
+          SCHEMA_ARN: !GetAtt GlueSchema.Arn
+          QUEUE_URL: !GetAtt UnprocessedEventsDLQ.QueueUrl
+      Role: !GetAtt 'PipelineRole.Arn'
+      InlineCode: |
+        import subprocess
+        import sys
+        subprocess.call('pip install jsonschema -t /tmp/ --no-cache-dir'.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        sys.path.insert(1, '/tmp/')
+        import json
+        import boto3
+        from jsonschema import validate, ValidationError
+        import base64
+        import os
+
+        sqs = boto3.client('sqs')
+        glue = boto3.client('glue')
+
+
+        def get_schema(schema_name):
+            # Get the schema from the Glue Schema Registry
+            schema_arn = os.getenv('SCHEMA_ARN')
+            
+            # Retrieve the schema metadata
+            schema_metadata = glue.get_schema_version(
+                SchemaId={
+                    'SchemaArn': schema_arn
+                },
+                SchemaVersionNumber={
+                'LatestVersion': True
+                }
+            )
+            # Retrieve the schema content
+            schema_content = schema_metadata['SchemaDefinition']
+            return json.loads(schema_content)
+
+        def lambda_handler(event, context):
+            schema = get_schema('iap_transaction')
+            queue_url = os.getenv('QUEUE_URL')
+            output = []
+            valid = 0
+            invalid = 0
+            for record in event['records']:
+                decoded_payload = base64.b64decode(record['data']).decode('utf-8')
+                try:
+                    payload = json.loads(decoded_payload)
+                    validate(payload, schema)
+                except ValidationError as e:
+                    # Record is invalid, send it to the SQS dead letter queue
+                    invalid +=1
+                    error = str({'error':e})
+                    sqs.send_message(
+                        QueueUrl=queue_url,
+                        MessageBody=decoded_payload+error,
+                    )
+                    output_record = {
+                        'recordId': record['recordId'],
+                        'result': 'Dropped',
+                        'data': record['data']
+                    }
+                    output.append(output_record)
+                else:
+                    valid +=1
+                    output_record = {
+                        'recordId': record['recordId'],
+                        'result': 'Ok',
+                        'data': base64.b64encode(decoded_payload.encode('utf-8')).decode('utf-8')
+                    }
+                    output.append(output_record)
+            print(f'{valid} validated successfully\n{invalid} sent to DLQ')
+            return {'records': output}
+
+ ### ROLE & POLICIES ### 
+  PipelineRole: 
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-role'
+      Description: IAM role for Lambda functions
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - firehose.amazonaws.com
+                - kinesis.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  PipelineRolePolicy: 
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      ManagedPolicyName: !Sub '${AWS::StackName}-policy'
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: 
+              - 'logs:PutLogEvents'
+              - 'logs:CreateLogStream'
+              - 'logs:CreateLogGroup'
+              - 'cloudwatch:PutMetricData'
+            Resource: "*"
+          - Effect: "Allow"
+            Action: 
+              - 'kinesis:*'
+            Resource: !GetAtt 'Kinesis.Arn'
+          - Effect: "Allow"
+            Action: 
+              - 'lambda:*'
+            Resource: 
+              - !GetAtt 'ValidateEventsLambda.Arn'
+              - !GetAtt 'HttpApiLambda.Arn'
+          - Effect: "Allow"
+            Action: 
+              - 'glue:*'
+            Resource: !GetAtt GlueSchema.Arn
+          - Effect: "Allow"
+            Action: 
+              - 'glue:GetSchemaVersion'
+            Resource: "*"
+          - Effect: "Allow"
+            Action: 
+              - 's3:*'
+            Resource: 
+              - !GetAtt 'S3BucketRawData.Arn'
+              - !Sub '${S3BucketRawData.Arn}/*'
+          - Effect: "Allow"
+            Action: 
+              - 'sqs:SendMessage'
+            Resource: "*"
+      Roles: [!Ref PipelineRole]
+
+### KINESIS ###
+  Kinesis:
+    Type: AWS::Kinesis::Stream
+    Properties: 
+      Name: !Sub '${AWS::StackName}-kinesisStream'
+      RetentionPeriodHours: 24
+      ShardCount: !Ref KinesisShards
+
+  Firehose: 
+    DependsOn: 
+      - PipelineRolePolicy
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties: 
+        DeliveryStreamType: KinesisStreamAsSource
+        KinesisStreamSourceConfiguration: 
+            KinesisStreamARN: !GetAtt 'Kinesis.Arn'
+            RoleARN: !GetAtt 'PipelineRole.Arn'
+        ExtendedS3DestinationConfiguration: 
+            BucketARN: !GetAtt 'S3BucketRawData.Arn'
+            BufferingHints: 
+                IntervalInSeconds: !Ref FirehoseInterval
+                SizeInMBs: 5
+            CompressionFormat: GZIP
+            RoleARN: !GetAtt 'PipelineRole.Arn'
+            ProcessingConfiguration:
+                Enabled: true
+                Processors:
+                  - Type: Lambda
+                    Parameters:
+                      - ParameterName: "LambdaArn"
+                        ParameterValue: !GetAtt ValidateEventsLambda.Arn
+
+### S3 ###
+  S3BucketRawData:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-data'
+
+### SQS Queues ###
+  UnprocessedEventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: false 
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 43200
+
+### GLUE SCHEMA ###
+  GlueSchema:
+    Type: AWS::Glue::Schema
+    Properties:
+      Name: !Sub '${AWS::StackName}-schema'
+      DataFormat: JSON
+      Compatibility: BACKWARD
+      SchemaDefinition: |
+        {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "$id": "http://example.com/iap_transaction.json",
+          "type": "object",
+          "title": "iap_transaction",
+          "required": [
+            "event_version",
+            "event_id",
+            "event_name",
+            "event_timestamp",
+            "app_version",
+            "event_data"
+          ],
+          "additionalProperties": true,
+          "properties": {
+            "event_version": {
+              "type": "string"
+            },
+            "event_id": {
+              "type": "string"
+            },
+            "event_name": {
+              "type": "string"
+            },
+            "event_timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "app_version": {
+              "type": "string"
+            },
+            "event_data": {
+              "type": "object",
+              "required": [
+                "item_version",
+                "country_id",
+                "currency_type",
+                "bundle_name",
+                "amount",
+                "platform",
+                "transaction_id"
+              ],
+              "additionalProperties": true,
+              "properties": {
+                "item_version": {
+                  "type": "integer"
+                },
+                "country_id": {
+                  "type": "string"
+                },
+                "currency_type": {
+                  "type": "string"
+                },
+                "bundle_name": {
+                  "type": "string"
+                },
+                "amount": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "platform": {
+                  "type": "string"
+                },
+                "transaction_id": {
+                  "type": "string",
+                  "pattern": "^[a-fA-F0-9-]{36}$"
+                }
+              }
+            }
+          }
+        }
